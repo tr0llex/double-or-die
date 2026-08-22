@@ -18,6 +18,8 @@
 import {
   BetState,
   BETS,
+  FX_ONE,
+  cashOutValue,
   ENEMIES,
   ENEMY_BULLET,
   ENEMY_OWNER,
@@ -49,8 +51,32 @@ export interface BetRecord {
   player: number;
   /** Строковый id из каталога: `no_damage`, `under_45s`, … Знаменатель G10. */
   id: string;
-  /** Кон в фишках — уже с поправкой «не больше кошелька». */
+  /**
+   * Кон в фишках — уже с поправкой «не больше кошелька». Всегда неотрицателен:
+   * у Ставки Крупье ядро хранит его со знаком минус (это его метка), а
+   * наблюдателю метка не нужна — у него для этого есть `ace`.
+   */
   stake: number;
+  /**
+   * Ставка Крупье: ставит он, из своего кармана, выплата один к одному
+   * (ECONOMY §10А). Пишется полем, а не выводится из знака кона: G12 отличал
+   * её по `stake < 0`, то есть по внутренней метке ядра, которую ядро вправе
+   * поменять, не сказав никому.
+   */
+  ace: boolean;
+  /**
+   * Сколько фишек пари принесло игроку на расчёте, ровно по правилам ядра:
+   * выигрыш — `кон × множитель` (а у Ставки Крупье — её кон один к одному),
+   * обналичивание — `кон × (1 + q(M−1)/2)`, провал — ноль.
+   *
+   * Считается тем же кодом, что платит (`cashOutValue`), и снимается ДО тика
+   * разрешения: после него прогресс `q` уже стёрт, и восстановить выплату
+   * нечем. Это единственный способ считать доход пари точно — G5 до этого
+   * брал НОМИНАЛЬНЫЙ множитель каталога и огрублял обналиченное до `q≈1`,
+   * то есть считал не то, что игрок получил, а то, что он получил бы в
+   * среднем по своим же предположениям.
+   */
+  payout: number;
   /** Тир аппетита в момент взятия: `modest` / `normal` / `go_big` (G4). */
   tier: string;
   floor: number;
@@ -113,6 +139,14 @@ export class Observer {
   /** Пари в работе: индекс слота → запись, которую ещё предстоит закрыть. */
   private readonly open = new Map<number, BetRecord>();
   private readonly betState = new Int32Array(MAX_PLAYERS * MAX_ACTIVE_BETS);
+  /**
+   * Что стоило бы каждое активное пари, обналичь его игрок ПРЯМО СЕЙЧАС.
+   *
+   * Снимается перед тиком вместе с остальными уликами и по той же причине:
+   * прогресс `q` живёт только пока пари активно, а к разбору после тика от
+   * него не остаётся ничего.
+   */
+  private readonly cashValue = new Int32Array(MAX_PLAYERS * MAX_ACTIVE_BETS);
 
   private readonly hearts = new Int32Array(MAX_PLAYERS);
   private readonly px = new Int32Array(MAX_PLAYERS);
@@ -155,6 +189,12 @@ export class Observer {
     this.bOwner.set(s.bOwner);
     this.bX.set(s.bX);
     this.bY.set(s.bY);
+    for (let p = 0; p < s.playerCount; p++) {
+      for (let n = 0; n < MAX_ACTIVE_BETS; n++) {
+        const k = p * MAX_ACTIVE_BETS + n;
+        this.cashValue[k] = s.aState[k] === BetState.Active ? cashOutValue(s, p, n) : 0;
+      }
+    }
   }
 
   /** Разобрать, что тик изменил. */
@@ -195,7 +235,9 @@ export class Observer {
           const rec: BetRecord = {
             player: p,
             id: BETS[s.aBet[k]].id,
-            stake: s.aStake[k],
+            stake: Math.abs(s.aStake[k]),
+            ace: s.aStake[k] < 0,
+            payout: 0,
             tier: TIER_NAMES[tier],
             floor: s.meta[Meta.Floor],
             room: s.meta[Meta.Room],
@@ -219,9 +261,28 @@ export class Observer {
         }
         rec.outcome = outcomeOf(now);
         rec.resolvedAt = s.tick;
+        rec.payout = this.payoutOf(rec, now, k, s.aBet[k]);
         this.open.delete(k);
       }
     }
+  }
+
+  /**
+   * Сколько фишек принесло разрешившееся пари — теми же правилами, что платит
+   * ядро (`settleBets`, `cashOut` в `bets.ts`).
+   *
+   * Копия формулы, а не вызов: платит ядро внутри тика, а наблюдатель разбирает
+   * его последствия снаружи — к моменту разбора и состояние пари, и прогресс
+   * уже другие. Поэтому обналиченное берётся из снимка ДО тика (`cashValue`),
+   * а выигрыш пересчитывается по кону и множителю, которые не меняются.
+   */
+  private payoutOf(rec: BetRecord, state: number, k: number, bet: number): number {
+    if (state === BetState.Cashed) return this.cashValue[k];
+    if (state !== BetState.Won) return 0;
+    // Ставка Крупье платит один к одному и из его кармана: кон игрока в ней
+    // не участвует вовсе (ECONOMY §10А).
+    if (rec.ace) return rec.stake;
+    return Math.trunc((rec.stake * BETS[bet].multiplier) / FX_ONE);
   }
 
   /**

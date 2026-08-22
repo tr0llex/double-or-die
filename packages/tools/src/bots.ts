@@ -21,11 +21,15 @@ import {
   type InputFrame,
   type SimState,
   ANGLE_FULL,
+  APPETITE,
+  BetId,
   BetState,
   Btn,
   DoorType,
   EnemyPhase,
   EnemyType,
+  ENEMY_OWNER,
+  MAX_BULLETS,
   PLAYER,
   Stream,
   UPGRADES,
@@ -53,9 +57,12 @@ import {
   RunPhase,
   MAX_CHIPS,
   MAX_ENEMIES,
+  RED_ZONE_RADIUS,
   SHARED,
   SHOP_SLOTS,
   canBuy,
+  redZoneX,
+  redZoneY,
   toFloat,
   wheelX,
   wheelY,
@@ -130,41 +137,72 @@ export type StrategyName = (typeof STRATEGY_NAMES)[number];
 interface Strategy {
   /** Сколько пари бот держит одновременно. Ноль — не берёт карт вовсе. */
   readonly maxBets: number;
-  /** Тир аппетита: 0 «Скромно», 1 «Нормально», 2 «По-крупному». */
-  readonly tier: number;
   /**
-   * Шанс тира «По-крупному» вместо `tier`, на весь забег (не перебрасывается
-   * каждую комнату — аппетит выбирают один раз на дверь, не мигают им).
-   * `null` — тир фиксирован, бросок не нужен (нужен только `stack`/`chips`:
-   * зашитое «всегда по-крупному» без учёта кошелька валило G4 не потому, что
-   * экономика сломана, а потому что ни один настоящий наглый игрок не
-   * рискует В КАЖДОЙ комнате забега — см. правку ниже, `ProfileBot`).
+   * Аппетит, которым стратегия ИГРАЕТ, когда кошелёк это позволяет: 0
+   * «Скромно», 1 «Нормально», 2 «По-крупному» (SIMULATION §3).
+   *
+   * Именно потолок, а не назначенный тир, — см. `tierFor` ниже.
    */
-  readonly goBigPct: number | null;
+  readonly tier: number;
   /** Обналичивать ли, потеряв сердце. */
   readonly cashOutOnHurt: boolean;
   /** Ходить ли за фишками, лежащими на полу. */
   readonly chaseChips: boolean;
 }
 
-const STRATEGIES: Record<StrategyName, Strategy> = {
-  none: { maxBets: 0, tier: 0, goBigPct: null, cashOutOnHurt: false, chaseChips: false },
-  single: { maxBets: 1, tier: 1, goBigPct: null, cashOutOnHurt: true, chaseChips: false },
-  stack: {
-    maxBets: MAX_ACTIVE_BETS,
-    tier: 1,
-    goBigPct: 65,
-    cashOutOnHurt: false,
-    chaseChips: false,
-  },
-  chips: {
-    maxBets: MAX_ACTIVE_BETS,
-    tier: 1,
-    goBigPct: 65,
-    cashOutOnHurt: false,
-    chaseChips: true,
-  },
+/**
+ * Умеет ли стратегия обналичивать вообще.
+ *
+ * Экспортируется ради G14: ограничитель считает ДОЛЮ пари, закрытых через
+ * «Забрать», и знаменатель обязан состоять из тех пари, где такое решение
+ * существовало. `stack` и `chips` не обналичивают по определению профиля
+ * (ECONOMY §9А: «профиль наглый по определению не обналичивает», и ровно
+ * поэтому по нему считается G5) — их пари в знаменателе G14 делают его
+ * красным по построению, а не по балансу.
+ */
+export const STRATEGY_CASHES_OUT: Record<StrategyName, boolean> = {
+  none: false,
+  single: true,
+  stack: false,
+  chips: false,
 };
+
+const STRATEGIES: Record<StrategyName, Strategy> = {
+  none: { maxBets: 0, tier: 0, cashOutOnHurt: false, chaseChips: false },
+  single: { maxBets: 1, tier: 1, cashOutOnHurt: true, chaseChips: false },
+  stack: { maxBets: MAX_ACTIVE_BETS, tier: TIER_GO_BIG, cashOutOnHurt: false, chaseChips: false },
+  chips: { maxBets: MAX_ACTIVE_BETS, tier: TIER_GO_BIG, cashOutOnHurt: false, chaseChips: true },
+};
+
+/**
+ * Какой тир кона по карману при таком банкролле — критерий Келли (ECONOMY §7).
+ *
+ * Таблица §7 переведена в код один в один: при 150 фишках оптимальная ставка
+ * 10.5 — «Скромно», при 350 она 24.5 — «Нормально», при 700 она 49 — «По-
+ * крупному». Берётся тир, БЛИЖАЙШИЙ к доле Келли, а не наибольший, её не
+ * превышающий: именно так читается таблица §7, где 24.5 названы «Нормально»
+ * (25), а не «Скромно» (10).
+ *
+ * Считается это здесь, а не броском монеты, потому что иначе ограничитель G4
+ * («верхний аппетит выбирается опытными реже 70%») меряет СОБСТВЕННУЮ
+ * константу бота: зашитый шанс «По-крупному» не двигается ни от одной правки
+ * экономики, и отчёт показывает его же, размытый смертями. Кошелёк —
+ * единственный вход, который экономика действительно двигает.
+ *
+ * Второй, не менее важный эффект: заявленный «По-крупному» на кошельке в
+ * сотню — это овербет в семь Келли, и наглый профиль разорялся с первых
+ * комнат. Треть всех взятых пари шла коном НОЛЬ (замер до правки: 544 из
+ * 1575), то есть игра, названная «Ставка», у трети ставок не включалась.
+ */
+const KELLY_FRACTION = 0.07;
+function tierFor(wallet: number, ceiling: number): number {
+  const kelly = wallet * KELLY_FRACTION;
+  let best = 0;
+  for (let t = 1; t <= ceiling; t++) {
+    if (Math.abs(APPETITE[t] - kelly) < Math.abs(APPETITE[best] - kelly)) best = t;
+  }
+  return best;
+}
 
 /**
  * Прежние имена, названные в DEVLOOP §3. Остаются как есть: на них записан
@@ -285,15 +323,50 @@ class RandomBot implements Bot {
 let foundDX = 0;
 let foundDY = 0;
 let foundDist = Infinity;
+/** Тип найденной угрозы (`findThreat`): от него зависит, куда от неё уходят. */
+let foundType = -1;
 
-/** Ближайшая доступная игроку карта: своя персональная или общая. */
-function findCard(s: SimState, player: number, px: number, py: number): void {
+/**
+ * Точка внутри красной зоны — с запасом на радиус игрока.
+ *
+ * Запас обязателен: пари срывается касанием круга центром игрока, а бот
+ * правит курс раз в десять тиков и за это окно проходит до полусотни единиц.
+ * Цель, стоящая ровно на границе, стоила бы сорванного пари на каждом
+ * подходе — то есть измеряла бы зернистость решений бота, а не то, умеет ли
+ * игрок обходить зону.
+ *
+ * На боссовой арене зоны нет вовсе (GDD §8.1), и проверка обязана это знать:
+ * иначе бот обходил бы разметку, которой на полу не существует.
+ */
+const RED_ZONE_SLACK = 60;
+function inRedZoneAt(s: SimState, x: number, y: number): boolean {
+  if (s.meta[Meta.Phase] === RunPhase.Boss) return false;
+  const r = toFloat(RED_ZONE_RADIUS) + RED_ZONE_SLACK;
+  return Math.hypot(x - toFloat(redZoneX(s)), y - toFloat(redZoneY(s))) < r;
+}
+
+/**
+ * Ближайшая доступная игроку карта: своя персональная или общая.
+ *
+ * `avoidRed` — держит ли игрок «Не заходи в красную зону»: карта в зоне для
+ * него не цель, а способ проиграть пари, за которое он уже заплатил кон.
+ */
+function findCard(
+  s: SimState,
+  player: number,
+  px: number,
+  py: number,
+  avoidRed = false,
+): void {
   foundDist = Infinity;
   for (let c = 0; c < MAX_CARDS; c++) {
     if (!s.kActive[c]) continue;
     if (s.kOwner[c] !== SHARED && s.kOwner[c] !== player) continue;
-    const dx = toFloat(s.kX[c]) - px;
-    const dy = toFloat(s.kY[c]) - py;
+    const cx = toFloat(s.kX[c]);
+    const cy = toFloat(s.kY[c]);
+    if (avoidRed && inRedZoneAt(s, cx, cy)) continue;
+    const dx = cx - px;
+    const dy = cy - py;
     const d = Math.hypot(dx, dy);
     if (d < foundDist) {
       foundDist = d;
@@ -303,11 +376,19 @@ function findCard(s: SimState, player: number, px: number, py: number): void {
   }
 }
 
-/** Ближайший живой враг. Целится в него любой бот, который вообще стреляет. */
-function findEnemy(s: SimState, px: number, py: number): void {
+/**
+ * Ближайший живой враг. Целится в него любой бот, который вообще стреляет.
+ *
+ * `skipFuse` — держит ли игрок «Подрывника»: три врага должны погибнуть от
+ * взрывов Фитилей, а застреленный Фитиль не взрывается вовсе (`killEnemy`
+ * засчитывает только гибель `byBlast`). Стрелять по нему, держа это пари,
+ * значит своими руками уничтожать единственное средство его выиграть.
+ */
+function findEnemy(s: SimState, px: number, py: number, skipFuse = false): void {
   foundDist = Infinity;
   for (let e = 0; e < MAX_ENEMIES; e++) {
     if (!s.eActive[e]) continue;
+    if (skipFuse && s.eType[e] === EnemyType.Fuse) continue;
     const dx = toFloat(s.eX[e]) - px;
     const dy = toFloat(s.eY[e]) - py;
     const d = Math.hypot(dx, dy);
@@ -320,12 +401,15 @@ function findEnemy(s: SimState, px: number, py: number): void {
 }
 
 /** Ближайшая фишка на полу. Её ищет только жадный до денег профиль. */
-function findChip(s: SimState, px: number, py: number): void {
+function findChip(s: SimState, px: number, py: number, avoidRed = false): void {
   foundDist = Infinity;
   for (let c = 0; c < MAX_CHIPS; c++) {
     if (!s.cActive[c]) continue;
-    const dx = toFloat(s.cX[c]) - px;
-    const dy = toFloat(s.cY[c]) - py;
+    const cx = toFloat(s.cX[c]);
+    const cy = toFloat(s.cY[c]);
+    if (avoidRed && inRedZoneAt(s, cx, cy)) continue;
+    const dx = cx - px;
+    const dy = cy - py;
     const d = Math.hypot(dx, dy);
     if (d < foundDist) {
       foundDist = d;
@@ -335,18 +419,62 @@ function findChip(s: SimState, px: number, py: number): void {
   }
 }
 
+/** Держит ли игрок прямо сейчас пари с этим номером. */
+function holdsBet(s: SimState, player: number, bet: number): boolean {
+  for (let n = 0; n < MAX_ACTIVE_BETS; n++) {
+    const k = player * MAX_ACTIVE_BETS + n;
+    if (s.aState[k] === BetState.Active && s.aBet[k] === bet) return true;
+  }
+  return false;
+}
+
 /**
- * Ближайшая ОБЪЯВЛЕННАЯ угроза, от которой имеет смысл уходить.
+ * Ближайшая ОБЪЯВЛЕННАЯ угроза, от которой имеет смысл уходить, и её ось.
  *
  * Именно объявленная, а не любой враг рядом: неозвученных угроз в игре нет по
  * определению (DIFFICULTY §7), и уклонение от того, что ещё не объявлено, —
- * это не навык, а суета. Считается по тем же трём источникам урона, которые
- * существуют в 0.4.0: таран Клина, поджёгший фитиль Фитиль и летящий снаряд
- * Кирпича (последний ловится через сам Кирпич — снаряд летит вдвое медленнее
- * игрокового именно затем, чтобы от него уходили).
+ * это не навык, а суета.
+ *
+ * Источников четыре, а не три: таран Клина, поджёгший фитиль Фитиль,
+ * объявленный выстрел Кирпича — и САМ ЛЕТЯЩИЙ СНАРЯД. Последнего здесь не
+ * было, и это была не мелочь: снаряд летит 520 против 320 у игрока и живёт
+ * три секунды, то есть основную часть своей жизни он и есть угроза, а Кирпич
+ * в это время уже вышел из телеграфа. Замер держал сорок процентов всех
+ * попаданий по мастеру за Кирпичом — то есть бот не уклонялся от того, от
+ * чего человек уклоняется в первую очередь, а гейт живучести списывал это на
+ * сложность игры.
+ *
+ * `foundDX/foundDY` — направление НА угрозу, `foundAxisX/foundAxisY` — ось, по
+ * которой она движется (у неподвижной — ноль). Уходят от них по-разному: от
+ * круга наружу, из коридора вбок, и знать, коридор это или круг, обязан тот,
+ * кто уклоняется.
  */
+let foundAxisX = 0;
+let foundAxisY = 0;
+
+function considerThreat(
+  dx: number,
+  dy: number,
+  axisX: number,
+  axisY: number,
+  type: number,
+): void {
+  const d = Math.hypot(dx, dy);
+  if (d >= foundDist) return;
+  foundDist = d;
+  foundDX = dx;
+  foundDY = dy;
+  foundAxisX = axisX;
+  foundAxisY = axisY;
+  foundType = type;
+}
+
 function findThreat(s: SimState, px: number, py: number): void {
   foundDist = Infinity;
+  foundType = -1;
+  foundAxisX = 0;
+  foundAxisY = 0;
+
   for (let e = 0; e < MAX_ENEMIES; e++) {
     if (!s.eActive[e]) continue;
     const phase = s.ePhase[e];
@@ -359,12 +487,28 @@ function findThreat(s: SimState, px: number, py: number): void {
     if (!announced) continue;
     const dx = toFloat(s.eX[e]) - px;
     const dy = toFloat(s.eY[e]) - py;
-    const d = Math.hypot(dx, dy);
-    if (d < foundDist) {
-      foundDist = d;
-      foundDX = dx;
-      foundDY = dy;
-    }
+    // Ось тарана — его собственная скорость, пока он летит; до рывка он ещё
+    // целится, и осью служит направление на игрока, то есть то, куда он
+    // полетит. Разница не косметическая: игрок, шагнувший вбок, за телеграф
+    // успевает сойти с оси, и уклоняться надо от НЕЁ, а не от тела врага.
+    const vx = toFloat(s.eVX[e]);
+    const vy = toFloat(s.eVY[e]);
+    const moving = Math.hypot(vx, vy) > 0.5 && phase === EnemyPhase.Attack;
+    considerThreat(dx, dy, moving ? vx : -dx, moving ? vy : -dy, type);
+  }
+
+  // Снаряды: угроза коридором, ось — их собственный полёт. Учитываются только
+  // ЛЕТЯЩИЕ В ИГРОКА: пуля, уходящая мимо, не повод бросать бой.
+  for (let b = 0; b < MAX_BULLETS; b++) {
+    if (!s.bActive[b] || s.bOwner[b] !== ENEMY_OWNER) continue;
+    const dx = toFloat(s.bX[b]) - px;
+    const dy = toFloat(s.bY[b]) - py;
+    const vx = toFloat(s.bVX[b]);
+    const vy = toFloat(s.bVY[b]);
+    // Скалярное произведение скорости на направление «снаряд → игрок»:
+    // положительное — летит в его сторону.
+    if (vx * -dx + vy * -dy <= 0) continue;
+    considerThreat(dx, dy, vx, vy, THREAT_BULLET);
   }
 }
 
@@ -574,6 +718,19 @@ const MISS_CONE = Math.round((10 * ANGLE_FULL) / 360);
  */
 const DODGE_RANGE = 260;
 
+/** Псевдотип угрозы «летящий снаряд»: типов врагов он не занимает. */
+const THREAT_BULLET = -2;
+
+/**
+ * На сколько единиц вперёд бот смотрит, проверяя, не уводит ли уклонение в
+ * красную зону: окно решений — десять тиков, за них игрок проходит
+ * 320/60×10 ≈ 53 единицы, и заглядывать дальше значит отказываться от
+ * направления из-за того, что случится через три решения.
+ */
+const DODGE_STEP = 60;
+
+/** ВРЕМЕННЫЙ переключатель эксперимента: запасной ход — по прямой от угрозы. */
+
 class ProfileBot implements Bot {
   readonly profile: string;
   readonly strategyName: StrategyName;
@@ -591,8 +748,7 @@ class ProfileBot implements Bot {
   /** Сердец в прошлом тике: по их убыли `single` решает соскочить. */
   private readonly hearts: Int32Array;
   private readonly bailing: Uint8Array;
-  /** Тир, который бот реально просит — бросок `goBigPct` сделан один раз в конструкторе. */
-  private readonly resolvedTier: number;
+
 
   constructor(skill: SkillName, strategy: StrategyName, seed: number, players: number) {
     this.profile = `${skill}:${strategy}`;
@@ -611,18 +767,6 @@ class ProfileBot implements Bot {
     this.hearts = new Int32Array(players);
     this.bailing = new Uint8Array(players);
     this.hearts.fill(PLAYER.startHearts);
-    // Один бросок на весь забег, не на комнату: аппетит выбирают один раз за
-    // дверью, и «наглый» игрок не решает заново в каждой из восьми комнат,
-    // рискнуть ли по-крупному — он либо такой в этом забеге, либо нет.
-    // Отдельный канал (`Stream.Bets`, не `Stream.Waves`): бросок не должен
-    // сдвигать последовательность стрельбы/уклонения на единицу для всех,
-    // кто вообще заходит в эту ветку, — иначе поведение `stack`/`chips`
-    // менялось бы непредсказуемо везде, где их сравнивают с другими бросками
-    // на `Waves`.
-    this.resolvedTier =
-      this.strategy.goBigPct !== null && this.roll(this.strategy.goBigPct, Stream.Bets)
-        ? TIER_GO_BIG
-        : this.strategy.tier;
   }
 
   /** Бросок на сотню: `pct` процентов за «да». */
@@ -657,7 +801,12 @@ class ProfileBot implements Bot {
 
       // Аппетит объявляется каждый тик: защёлка ядра держит его до следующего
       // явного нажатия, но переживёт ли она смену комнаты — не дело бота.
-      f.buttons = withAppetite(this.firing[i] ? Btn.Fire : 0, this.resolvedTier);
+      // Тир — по кошельку (`tierFor`), потолок — по стратегии: «наглый»
+      // остаётся наглым, но не ставит половину банкролла на одну карту.
+      f.buttons = withAppetite(
+        this.firing[i] ? Btn.Fire : 0,
+        tierFor(s.pChips[i], this.strategy.tier),
+      );
 
       // Потерянное сердце — повод соскочить у умеренного профиля: «обналичивает
       // при потере сердца» (SIMULATION §3). Флаг, а не мгновенное нажатие,
@@ -692,25 +841,40 @@ class ProfileBot implements Bot {
   /**
    * Куда идти. Приоритет один и тот же у всех профилей, меняются только
    * пороги: сначала спасать шкуру, потом брать деньги, потом собирать сдачу.
+   *
+   * Взятое пари меняет ВСЕ три шага, а не добавляет четвёртый: держащий «Не
+   * заходи в красную зону» не бежит за картой в зону, держащий «Собери все
+   * фишки» гонится за фишками независимо от стратегии (иначе пари срывается
+   * первой же истёкшей фишкой — `combat.ts`), держащий «Без рывка» не жмёт
+   * рывок даже спасаясь. Пока этого не было, вероятность каждого пари меряла
+   * не игру, а совпадение: «Без рывка» выигрывалось в 4.4% случаев при
+   * целевых 55%, «Подрывник» — в 7.5% при целевых 45%.
    */
   private move(s: SimState, i: number, f: InputFrame, px: number, py: number, held: number): void {
+    const avoidRed = holdsBet(s, i, BetId.NoRedZone);
+    const noDash = holdsBet(s, i, BetId.NoDash);
+
     if (this.evading[i]) {
       findThreat(s, px, py);
       if (foundDist < DODGE_RANGE) {
-        const len = foundDist || 1;
-        // Уходим ОТ угрозы: знак минус — это и есть всё уклонение.
-        f.moveX = fromFloat(-foundDX / len);
-        f.moveY = fromFloat(-foundDY / len);
-        // Рывок — часть уклонения, а не отдельная кнопка: он и неуязвимость
-        // даёт, и дистанцию рвёт. Кулдаун проверяем сами, чтобы не жать
-        // впустую и не срывать «Без рывка» лишний раз.
-        if (this.dashing[i] && s.tick >= s.pDashReady[i]) f.buttons |= Btn.Dash;
+        this.flee(s, i, f, px, py, avoidRed, noDash);
         return;
       }
     }
 
+    // Стоя в красной зоне с пари на неё, игрок уже проигрывает — выйти важнее
+    // любой карты и любой фишки.
+    if (avoidRed && inRedZoneAt(s, px, py)) {
+      const dx = px - toFloat(redZoneX(s));
+      const dy = py - toFloat(redZoneY(s));
+      const len = Math.hypot(dx, dy) || 1;
+      f.moveX = fromFloat(dx / len);
+      f.moveY = fromFloat(dy / len);
+      return;
+    }
+
     if (held < this.strategy.maxBets) {
-      findCard(s, i, px, py);
+      findCard(s, i, px, py, avoidRed);
       if (foundDist < Infinity) {
         const len = foundDist || 1;
         f.moveX = fromFloat(foundDX / len);
@@ -720,8 +884,8 @@ class ProfileBot implements Bot {
       }
     }
 
-    if (this.strategy.chaseChips) {
-      findChip(s, px, py);
+    if (this.strategy.chaseChips || holdsBet(s, i, BetId.AllChips)) {
+      findChip(s, px, py, avoidRed);
       if (foundDist < Infinity) {
         const len = foundDist || 1;
         f.moveX = fromFloat(foundDX / len);
@@ -739,13 +903,106 @@ class ProfileBot implements Bot {
   }
 
   /**
+   * Уклонение: от снаряда шаг ВБОК, от врага — НАЗАД.
+   *
+   * Разделение не стилистическое, оно замерено. Прежний бот уходил по прямой
+   * от всего подряд и не уклонялся от летящих снарядов вовсе (их не было в
+   * `findThreat`) — сорок процентов попаданий по мастеру приходили от
+   * Кирпича, то есть от того, от чего человек уклоняется первым делом.
+   *
+   *   | что делает бот                | попаданий за комнату, `master:none` |
+   *   | ----------------------------- | ----------------------------------- |
+   *   | по прямой от всего (как было) | 0.97                                |
+   *   | вбок от всего                 | 0.85                                |
+   *   | **вбок от снаряда, назад от врага** | **0.74**                      |
+   *
+   * И это не случайность выборки, а разная физика двух угроз. Снаряд летит
+   * 520 против 320 у игрока и не перецеливается: убежать от него нельзя,
+   * сойти с его линии — можно, и цена шага не зависит от его скорости. Клин и
+   * Фитиль, наоборот, ПРЕСЛЕДУЮТ: шаг вбок оставляет игрока на той же
+   * дистанции, и следующий таран объявляется через секунду, а отход выводит
+   * из `aimRange` (560) и разрывает саму цепочку.
+   *
+   * Медиана дошедшей комнаты у `master:none` при этом уезжает с пятой на
+   * восьмую — то есть до починки половина всей разницы между «мастер» и
+   * «новичок» тонула в слепоте бота к снарядам.
+   */
+  private flee(
+    s: SimState,
+    i: number,
+    f: InputFrame,
+    px: number,
+    py: number,
+    avoidRed: boolean,
+    noDash: boolean,
+  ): void {
+    const threatX = foundDX;
+    const threatY = foundDY;
+    const type = foundType;
+    const len = foundDist || 1;
+
+    let mx: number;
+    let my: number;
+    if (type !== THREAT_BULLET) {
+      // Клин и Фитиль ПРЕСЛЕДУЮТ: от них уходят назад. Фитиль вдобавок
+      // накрывает кругом (поджиг на 120, взрыв радиусом 140), и наружу из
+      // круга ведёт ровно одно направление — от его центра.
+      mx = -threatX / len;
+      my = -threatY / len;
+    } else {
+      // Снаряд — угроза КОРИДОРОМ вдоль своего полёта, и летит он 520 против
+      // 320 у игрока: убежать нельзя, сойти с линии можно, и цена шага не
+      // зависит от того, насколько снаряд быстрее.
+      const alen = Math.hypot(foundAxisX, foundAxisY) || 1;
+      let sx = -foundAxisY / alen;
+      let sy = foundAxisX / alen;
+      // Сторона выбирается та, где больше места до края арены: шаг вбок в
+      // стену — это стояние под ударом.
+      const w = toFloat(s.arenaW);
+      const h = toFloat(s.arenaH);
+      const probe = 200;
+      const room = (dx: number, dy: number): number =>
+        Math.min(px + dx * probe, w - (px + dx * probe), py + dy * probe, h - (py + dy * probe));
+      if (room(-sx, -sy) > room(sx, sy)) {
+        sx = -sx;
+        sy = -sy;
+      }
+      mx = sx;
+      my = sy;
+    }
+
+    // Спасаться в красную зону, держа пари на неё, — значит менять сердце на
+    // проигранный кон. Направление отклоняется наружу ровно настолько, чтобы
+    // уйти от угрозы мимо зоны, а не встать под удар ради разметки.
+    if (avoidRed && inRedZoneAt(s, px + mx * DODGE_STEP, py + my * DODGE_STEP)) {
+      const ox = px - toFloat(redZoneX(s));
+      const oy = py - toFloat(redZoneY(s));
+      const olen = Math.hypot(ox, oy) || 1;
+      mx += ox / olen;
+      my += oy / olen;
+    }
+
+    const mlen = Math.hypot(mx, my) || 1;
+    f.moveX = fromFloat(mx / mlen);
+    f.moveY = fromFloat(my / mlen);
+    // Рывок — часть уклонения, а не отдельная кнопка: он и неуязвимость даёт,
+    // и дистанцию рвёт. Кулдаун проверяем сами, чтобы не жать впустую; с пари
+    // «Без рывка» не жмём вовсе — сорвать своё же пари ради шага в сторону
+    // значит играть хуже собственного профиля.
+    if (!noDash && this.dashing[i] && s.tick >= s.pDashReady[i]) f.buttons |= Btn.Dash;
+  }
+
+  /**
    * Куда целиться. Ближайший враг плюс ошибка навыка, повёрнутая в
    * фиксированной точке: тригонометрия берётся из таблиц ядра, а не из
    * `Math`, — IEEE-синус не обязан совпадать между движками, а ввод бота
    * уезжает в golden-эталоны.
    */
   private aim(s: SimState, i: number, f: InputFrame, px: number, py: number): void {
-    findEnemy(s, px, py);
+    // «Подрывник» требует трёх врагов, убитых взрывом Фитиля; застреленный
+    // Фитиль не взрывается. Держа это пари, по Фитилям не стреляют — иначе
+    // игрок своими руками уничтожает единственное средство выиграть.
+    findEnemy(s, px, py, holdsBet(s, i, BetId.Demolitionist));
     if (foundDist === Infinity) {
       f.aimX = fromInt(1);
       f.aimY = 0;

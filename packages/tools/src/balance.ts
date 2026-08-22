@@ -56,7 +56,9 @@ import { makeBot, PROFILE_NAMES, type BotName } from './bots';
 import { Observer } from './observe';
 import { checkSafety } from './safety';
 import {
+  calibrateBets,
   computeConstraints,
+  formatCalibration,
   formatReport,
   type BetCatalogEntry,
   type BossFight,
@@ -75,15 +77,48 @@ import {
 export const BALANCE_TICK_CAP = 30 * 60 * TICK_HZ;
 
 /**
- * Сколько прогонов `novice:none` добавляется к каждому балансному прогону.
+ * Добавка «осторожных» к каждому балансному прогону: стратегия `none` по той
+ * же смеси навыков, что и `mixed`.
  *
- * Число фиксированное, а не доля от `--runs`: G1 проверяет «≥90% прогонов
- * доходят до этажа 2» — грубый порог, для которого тридцати прогонов хватает
- * с запасом (30 × 90% = 27, зазор в достижимую погрешность в один прогон
- * заметен). Больше — трата времени без выигрыша в точности; меньше — G1
- * начинает шуметь от одного случайного прогона.
+ * ДВА исправления против прежних «30 × novice:none».
+ *
+ * Первое — навык. «Осторожный» из ECONOMY §6 это СТРАТЕГИЯ («ноль ставок»), а
+ * не навык, и прогонять её одним новичком значит мерить G1 в самом жёстком из
+ * возможных прочтений: порог «первый этаж проходят ≥90%» назначался игроку,
+ * который не ставит, а не игроку, который вдобавок хуже всех стреляет.
+ * Скилловый состав берётся тот же, что у `mixed` (SIMULATION §3), — это и есть
+ * гипотеза об аудитории, и осторожные из неё не выпадают.
+ *
+ * Второе — объём. При тридцати прогонах половина доверительного интервала доли
+ * составляет 5.5 процентного пункта: три забега решают вердикт девяностого
+ * порога. Сто двадцать сжимают её до 2.7 — порог перестаёт зависеть от того,
+ * как лягут единичные сиды, а стоит это секунды.
  */
-const NONE_SUPPLEMENT_RUNS = 30;
+const NONE_SUPPLEMENT_RUNS = 120;
+
+/**
+ * Смесь навыков для добавки — ровно таблица SIMULATION §3 (`mixed`), только
+ * без её оси стратегий: стратегия здесь одна и заданная, `none`.
+ */
+const NONE_SUPPLEMENT_SKILLS: readonly BotName[] = [
+  'novice:none',
+  'median:none',
+  'veteran:none',
+  'master:none',
+];
+const NONE_SUPPLEMENT_WEIGHTS = [25, 40, 25, 10] as const;
+
+/** Какой навык достаётся `i`-му прогону добавки: раскладка по весам, без RNG. */
+function supplementBot(i: number): BotName {
+  const total = NONE_SUPPLEMENT_WEIGHTS.reduce((a, b) => a + b, 0);
+  const pos = ((i * total) / NONE_SUPPLEMENT_RUNS) % total;
+  let acc = 0;
+  for (let k = 0; k < NONE_SUPPLEMENT_SKILLS.length; k++) {
+    acc += NONE_SUPPLEMENT_WEIGHTS[k];
+    if (pos < acc) return NONE_SUPPLEMENT_SKILLS[k];
+  }
+  return NONE_SUPPLEMENT_SKILLS[NONE_SUPPLEMENT_SKILLS.length - 1];
+}
 
 /** Каталог множителей пари для G5 — тот же вид, что просит `computeConstraints`. */
 export const betCatalog: readonly BetCatalogEntry[] = BETS.map((b) => ({
@@ -173,7 +208,9 @@ export function runBalanceSample(seed: number, players: number, bot: BotName): S
       bossFloor = s.meta[Meta.Floor];
     } else if (!inBoss && bossActive) {
       bossActive = false;
-      bossFights.push({ floor: bossFloor, ticks: t - bossStart });
+      // Бой засчитывается доигранным, только если после него игрок ЖИВ:
+      // фаза босса кончается и смертью тоже, а такой замер меряет не босса.
+      bossFights.push({ floor: bossFloor, ticks: t - bossStart, won: anyAlive(s) });
     }
 
     if (s.meta[Meta.Phase] === RunPhase.Summary) break;
@@ -231,7 +268,7 @@ export function runBalance(opts: BalanceOptions): BalanceOutcome {
   // сидов между населениями — случайность, которую лучше не заводить.
   const noneSamples: Sample[] = [];
   for (let i = 0; i < NONE_SUPPLEMENT_RUNS; i++) {
-    noneSamples.push(runBalanceSample(opts.seed + 1_000_000 + i, 1, 'novice:none'));
+    noneSamples.push(runBalanceSample(opts.seed + 1_000_000 + i, 1, supplementBot(i)));
   }
 
   /*
@@ -264,13 +301,33 @@ export function runBalance(opts: BalanceOptions): BalanceOutcome {
   const skipped = report.filter((r) => r.verdict === 'not_measured');
   const totalSamples = mixedSamples.length + noneSamples.length;
 
+  /*
+   * Оборванные забеги — те, что упёрлись в потолок тиков, не дойдя до итогов,
+   * и нулевые коны — карты, взятые на пустой кошелёк.
+   *
+   * Обе величины молчали, а идут они в знаменатели: оборванный забег с
+   * неизвестным исходом считался наравне с доигранным, а нулевой кон — наравне
+   * со ставкой. Первую строку отчёт обязан показывать, потому что она про
+   * ИНСТРУМЕНТ (потолок мал или забег завис), вторую — потому что она про
+   * экономику: доля пари, у которых ставить было нечем.
+   */
+  const all = [...mixedSamples, ...noneSamples];
+  const broken = all.filter((r) => r.outcome === 'broken').length;
+  const own = all.flatMap((r) => r.observed.bets.filter((b) => !b.ace));
+  const zeroShare = own.length === 0 ? 0 : own.filter((b) => b.stake === 0).length / own.length;
+
   const header =
     `ГЕЙТ БАЛАНСА — 0.4.0, состав N=1 (кооп-составов нет)\n` +
-    `выборка: ${opts.runs} × mixed (всё, кроме G1/G2) + ${NONE_SUPPLEMENT_RUNS} × novice:none` +
-    ` (только G1/G2) = ${totalSamples} забегов · сид ${opts.seed}\n` +
-    `профилей «навык:стратегия» в игре: ${PROFILE_NAMES.length}\n`;
+    `выборка: ${opts.runs} × mixed (всё, кроме G1/G2) + ${NONE_SUPPLEMENT_RUNS} × none` +
+    ` по смеси навыков (только G1/G2) = ${totalSamples} забегов · сид ${opts.seed}\n` +
+    `профилей «навык:стратегия» в игре: ${PROFILE_NAMES.length}\n` +
+    `оборвано потолком тиков: ${broken} · пари на нулевой кон: ` +
+    `${(zeroShare * 100).toFixed(1)}% (в знаменатели долей не идут)\n`;
   const verdict = red.length === 0 ? 'ГЕЙТ ЗЕЛЁНЫЙ' : `ГЕЙТ КРАСНЫЙ — нарушено ${red.length}`;
-  const text = `${header}\n${formatReport(report)}\n\n${verdict} (${green.length} зелёных, ${red.length} красных, ${skipped.length} не считается)`;
+  const text =
+    `${header}\n${formatReport(report)}\n\n` +
+    `${formatCalibration(calibrateBets(mixedSamples, betCatalog))}\n\n` +
+    `${verdict} (${green.length} зелёных, ${red.length} красных, ${skipped.length} не считается)`;
 
   return {
     ok: red.length === 0,
